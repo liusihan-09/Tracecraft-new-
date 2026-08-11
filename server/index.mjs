@@ -1494,12 +1494,26 @@ function isDeepSeekBaseUrl(baseUrl = db.settings.baseUrl) {
   }
 }
 
+/** 仅 OpenAI 官方默认走 Responses；其余自定义网关/兼容代理默认走 Chat Completions */
+function preferChatCompletions(baseUrl = db.settings.baseUrl) {
+  try {
+    const host = new URL(baseUrl).hostname
+    return !(host === 'api.openai.com' || host.endsWith('.openai.com'))
+  } catch {
+    return true
+  }
+}
+
 function reviewModelConcurrency() {
   return isDeepSeekBaseUrl() ? 1 : 2
 }
 
 function isRetryableModelStatus(status) {
   return status === 408 || status === 425 || status === 429 || status >= 500
+}
+
+function isMissingEndpointStatus(status) {
+  return status === 404 || status === 405
 }
 
 function waitForRetry(attempt) {
@@ -1513,12 +1527,9 @@ function modelTransportMessage(error) {
   return code ? `网络连接失败（${code}）` : '网络连接失败'
 }
 
-async function callResponses(systemPrompt, userContent) {
-  const apiKey = secrets.apiKey || environmentApiKey
-  const baseUrl = db.settings.baseUrl.replace(/\/$/, '')
-  const isDeepSeek = isDeepSeekBaseUrl(baseUrl)
-  const url = `${baseUrl}${isDeepSeek ? '/chat/completions' : '/responses'}`
-  const body = isDeepSeek
+function buildModelRequest(baseUrl, useChatCompletions, systemPrompt, userContent) {
+  const url = `${baseUrl}${useChatCompletions ? '/chat/completions' : '/responses'}`
+  const body = useChatCompletions
     ? {
       model: db.settings.model,
       messages: [
@@ -1539,6 +1550,17 @@ async function callResponses(systemPrompt, userContent) {
       ],
       text: { verbosity: 'medium' },
     }
+  return { url, body }
+}
+
+function extractModelOutputText(payload) {
+  return payload.choices?.[0]?.message?.content || payload.output_text || payload.output
+    ?.flatMap((item) => item.content || [])
+    .map((item) => item.text || '')
+    .join('') || ''
+}
+
+async function callModelEndpoint(url, body, apiKey) {
   for (let attempt = 1; attempt <= MODEL_REQUEST_MAX_ATTEMPTS; attempt += 1) {
     let response
     try {
@@ -1561,20 +1583,44 @@ async function callResponses(systemPrompt, userContent) {
 
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) {
+      const message = payload.error?.message || `模型调用失败（${response.status}）`
+      if (isMissingEndpointStatus(response.status)) {
+        const error = new Error(message)
+        error.status = response.status
+        error.missingEndpoint = true
+        throw error
+      }
       if (isRetryableModelStatus(response.status) && attempt < MODEL_REQUEST_MAX_ATTEMPTS) {
         await waitForRetry(attempt)
         continue
       }
       const suffix = isRetryableModelStatus(response.status) ? `，已自动重试 ${attempt} 次` : ''
-      throw new Error(payload.error?.message || `模型调用失败（${response.status}）${suffix}`)
+      throw new Error(`${message}${suffix}`)
     }
-    const outputText = payload.choices?.[0]?.message?.content || payload.output_text || payload.output
-      ?.flatMap((item) => item.content || [])
-      .map((item) => item.text || '')
-      .join('') || ''
-    return outputText.trim()
+    return extractModelOutputText(payload).trim()
   }
   throw new Error('模型调用失败')
+}
+
+async function callResponses(systemPrompt, userContent) {
+  const apiKey = secrets.apiKey || environmentApiKey
+  const baseUrl = db.settings.baseUrl.replace(/\/$/, '')
+  const modes = preferChatCompletions(baseUrl) ? [true, false] : [false, true]
+  let lastError
+
+  for (let index = 0; index < modes.length; index += 1) {
+    const useChatCompletions = modes[index]
+    const { url, body } = buildModelRequest(baseUrl, useChatCompletions, systemPrompt, userContent)
+    try {
+      return await callModelEndpoint(url, body, apiKey)
+    } catch (error) {
+      lastError = error
+      // 当前协议路径不存在时，自动改试另一种（Chat Completions ↔ Responses）
+      if (error?.missingEndpoint && index < modes.length - 1) continue
+      throw error
+    }
+  }
+  throw lastError || new Error('模型调用失败')
 }
 
 async function generateAnalysisWithModel(requirement, answered, ignored, previousAnalysisData) {

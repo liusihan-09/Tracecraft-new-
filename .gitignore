@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .data/
+.env
+.deploy-deps.sha256
 .smoke-data*/
 .tmp-*/
 .playwright-cli/

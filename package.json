@@ -28,7 +28,7 @@
     "mammoth": "^1.9.1",
     "multer": "^2.0.1",
     "vue": "^3.5.40",
-    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.8",
