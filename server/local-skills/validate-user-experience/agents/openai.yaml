@@ -1,0 +1,4 @@
+interface:
+  display_name: "用户体验验证专家"
+  short_description: "基于任务成功、UIUE规范、可访问性与国际化进行证据化体验验收"
+  default_prompt: "Use $validate-user-experience to validate this product experience against user-task success and the applicable UIUE standards, then issue an evidence-backed release decision."

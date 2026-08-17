@@ -674,11 +674,12 @@ function normalizeUiReviewIssue(issue, counters) {
   }
 }
 
-export async function generateModelUiDesignReview({ requirement, analysis, design, uploadDir, callModel, systemPrompt, concurrency = REVIEW_CONCURRENCY }) {
+export async function generateModelUiDesignReview({ requirement, analysis, design, uploadDir, callModel, systemPrompt, validateContrastChecks = async () => [], concurrency = REVIEW_CONCURRENCY }) {
   const requirementContext = buildRequirementReviewContext(analysis || { sourceText: requirement.source?.text })
   const { jobs } = collectDesignReviewJobs(design, uploadDir)
   const contract = `只返回有效 JSON，不要 Markdown。输出：
-{"summary":"总体判断","strengths":["值得保留"],"evidenceLimitations":["证据限制"],"openQuestions":["待确认项"],"issues":[{"area":"visual|interaction|system|accessibility","priority":"P0|P1|P2","confidence":"confirmed|high|needs_review","title":"根因式标题","location":"可定位位置","phenomenon":"客观现象","evidence":"证据及来源","impact":"用户或系统影响","advice":"具体修改动作","verification":"修改后验证方法","people":"涉及角色","annotation":{"pageName":"页面名","pageFileName":"文件名","anchorText":"真实可见文本","x":50,"y":50,"coordinateMode":"normalized","confidence":0.8}}]}。
+{"summary":"总体判断","strengths":["值得保留"],"evidenceLimitations":["证据限制"],"openQuestions":["待确认项"],"contrastChecks":[{"foreground":"#333333","background":"#ffffff","mode":"normal|large|non_text","location":"可定位位置"}],"issues":[{"area":"visual|interaction|system|accessibility","priority":"P0|P1|P2","confidence":"confirmed|high|needs_review","title":"根因式标题","location":"可定位位置","phenomenon":"客观现象","evidence":"证据及来源","impact":"用户或系统影响","advice":"具体修改动作","verification":"修改后验证方法","people":"涉及角色","annotation":{"pageName":"页面名","pageFileName":"文件名","anchorText":"真实可见文本","x":50,"y":50,"coordinateMode":"normalized","confidence":0.8}}]}。
+contrastChecks 只有在输入证据提供了准确颜色值或设计 Token 时才能输出；截图估算颜色不得进入该字段。平台会调用 Skill 自带 contrast.py 复核每一项。
 平台会把 annotation 渲染为交互式问题标注点，因此本次不生成派生图片；无法可靠定位时不要编造坐标，annotation 可省略并把 confidence 设为 needs_review。不要把未展示的 hover、focus、loading、error 等状态直接判定为缺失，应写入 openQuestions。相同根因只输出一次。`
   const pageResults = await mapWithConcurrency(jobs, concurrency, async (job) => {
     const payload = boundedJson({
@@ -689,7 +690,9 @@ export async function generateModelUiDesignReview({ requirement, analysis, desig
     })
     const instruction = `按照 review-ui-design 完成当前页面的首轮 UI 设计评审，执行三秒印象、结构检查、细节检查和反证检查。页面名称：${job.name}。截图无法证明的精确像素、色值、隐藏状态或真实热区不得写成确定事实。${contract}\n输入证据：\n${payload}`
     try {
-      return parseJsonResponse(await callModel(systemPrompt, contentForJob(instruction, job)))
+      const result = parseJsonResponse(await callModel(systemPrompt, contentForJob(instruction, job)))
+      result.contrastChecks = await validateContrastChecks(result.contrastChecks)
+      return result
     } catch (error) {
       throw new Error(`review-ui-design 页面“${job.name}”评审失败：${error.message}`)
     }
@@ -714,7 +717,9 @@ export async function generateModelUiDesignReview({ requirement, analysis, desig
     }]
     for (const job of jobs.filter((item) => item.kind === 'image').slice(0, 12)) content.push({ type: 'input_image', image_url: job.imageUrl, detail: 'high' })
     try {
-      pageResults.push(parseJsonResponse(await callModel(systemPrompt, content)))
+      const result = parseJsonResponse(await callModel(systemPrompt, content))
+      result.contrastChecks = await validateContrastChecks(result.contrastChecks)
+      pageResults.push(result)
     } catch (error) {
       throw new Error(`review-ui-design 跨页面评审失败：${error.message}`)
     }
@@ -869,7 +874,7 @@ function rawValidationConclusion(issues, reportedConclusions = []) {
   return 'passed'
 }
 
-export async function generateModelRawRequirementReview({ requirement, design, uploadDir, callModel, compliancePrompt, experiencePrompt, experienceSkillVersion, concurrency = REVIEW_CONCURRENCY }) {
+export async function generateModelRawRequirementReview({ requirement, design, uploadDir, callModel, compliancePrompt, experiencePrompt, experienceSkillVersion, validateExperienceReport = async () => {}, concurrency = REVIEW_CONCURRENCY }) {
   const rawEvidence = await extractRawRequirementEvidence(requirement, callModel, concurrency)
   const { jobs, pixsoFrames } = collectDesignReviewJobs(design, uploadDir)
   const results = await mapWithConcurrency(jobs, 1, async (job) => {
@@ -885,7 +890,9 @@ export async function generateModelRawRequirementReview({ requirement, design, u
     const experienceInstruction = `请严格使用 validate-user-experience 的 design 模式验证用户任务是否能够成功完成，不得把专家启发式建议写成需求不符合。当前设计页面：${job.name}。静态设计证据不能证明点击、键盘、加载、权限、响应式或读屏行为，未展示状态必须进入 gaps 或标记 unverified。只返回 report-contract 定义的 JSON，并为每条 issue 增加 annotation。${locatorInstruction}输入证据：\n${payload}`
     try {
       const compliance = parseJsonResponse(await callModel(compliancePrompt, contentForJob(complianceInstruction, job)))
-      const experience = normalizeExperienceReport(parseJsonResponse(await callModel(experiencePrompt, contentForJob(experienceInstruction, job))))
+      const experienceReport = parseJsonResponse(await callModel(experiencePrompt, contentForJob(experienceInstruction, job)))
+      await validateExperienceReport(experienceReport)
+      const experience = normalizeExperienceReport(experienceReport)
       return {
         summary: `${cleanText(compliance.summary)}；${cleanText(experience.summary)}`,
         issues: [
@@ -907,10 +914,12 @@ export async function generateModelRawRequirementReview({ requirement, design, u
       designPages: pixsoFrames.map(compactFrameForGlobal),
     })
     try {
-      const journey = normalizeExperienceReport(parseJsonResponse(await callModel(experiencePrompt, [{
+      const journeyReport = parseJsonResponse(await callModel(experiencePrompt, [{
         type: 'input_text',
         text: `请使用 validate-user-experience 的 design 模式，只检查跨页面完整用户旅程、状态衔接、数据一致性和失败恢复，不重复逐页问题。只返回 report-contract JSON；每条 issue 增加可定位 annotation，无法证明的动态状态写入 gaps。输入证据：\n${globalPayload}`,
-      }])))
+      }]))
+      await validateExperienceReport(journeyReport)
+      const journey = normalizeExperienceReport(journeyReport)
       results.push({ summary: cleanText(journey.summary), issues: journey.issues, experience: journey })
     } catch (error) {
       throw new Error(`完整用户旅程评审失败：${error.message}`)

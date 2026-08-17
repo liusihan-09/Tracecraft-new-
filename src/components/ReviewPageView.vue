@@ -174,6 +174,10 @@ function elementText(element: HTMLElement) {
   return `${element.getAttribute('data-review-anchor') || ''}${element.innerText || element.textContent || ''}${element.getAttribute('aria-label') || ''}${element.getAttribute('placeholder') || ''}`
 }
 
+function elementIsVisible(element: HTMLElement) {
+  return !element.hidden && !element.closest('[hidden]') && element.offsetParent !== null
+}
+
 function designFrameName(element: HTMLElement) {
   return element.closest<HTMLElement>('.design-frame[data-page-name]')?.dataset.pageName || ''
 }
@@ -203,11 +207,11 @@ function annotationDistance(issue: ReviewIssue, element: HTMLElement) {
 }
 
 function visibleTargetFor(element: HTMLElement) {
-  if (element.offsetParent !== null) return element
+  if (elementIsVisible(element)) return element
   const field = element.closest<HTMLElement>('.form-row,[data-required-select],.form-item,.el-form-item')
-  if (!field) return undefined
+  if (!field || field.closest('[hidden]')) return undefined
   return Array.from(field.querySelectorAll<HTMLElement>('.select-trigger,input:not([type="hidden"]),select,textarea,[role="combobox"],button'))
-    .find(candidate => candidate.offsetParent !== null)
+    .find(elementIsVisible)
 }
 
 function stageNameFor(element: HTMLElement) {
@@ -218,6 +222,7 @@ function stagePreferenceScore(issue: ReviewIssue, stageName: string) {
   const title = issue.title
   const primaryLocation = issue.detail.match(/位置[：:]\s*([^；;。]+)/)?.[1] || ''
   const detail = issue.detail
+  const anchorText = issue.annotation?.anchorText || ''
   const keywords: Record<string, string[]> = {
     list: ['列表', '筛选', '表头'],
     create: ['创建', '名称字段', '资源实例'],
@@ -229,7 +234,7 @@ function stagePreferenceScore(issue: ReviewIssue, stageName: string) {
     pause: ['暂停确认', '暂停'],
   }
   return (keywords[stageName] || []).reduce((score, keyword) => {
-    return score + (title.startsWith(keyword) ? 9 : 0) + (title.includes(keyword) ? 5 : 0) + (primaryLocation.includes(keyword) ? 7 : 0) + (detail.includes(keyword) ? 1 : 0)
+    return score + (anchorText.includes(keyword) ? 12 : 0) + (title.startsWith(keyword) ? 9 : 0) + (title.includes(keyword) ? 5 : 0) + (primaryLocation.includes(keyword) ? 7 : 0) + (detail.includes(keyword) ? 1 : 0)
   }, 0)
 }
 
@@ -292,8 +297,15 @@ function locateInFrame(file: DesignFile) {
   if (!frame || !document) return
   const root = document.documentElement
   root.style.removeProperty('zoom')
+  const stages = Array.from(document.querySelectorAll<HTMLElement>('.stage'))
+  const visibleStage = stages.find(stage => !stage.hidden && stage.offsetParent !== null)
   const naturalWidth = Math.max(1, frameNaturalWidths.value[file.id] || 0, root.scrollWidth, document.body?.scrollWidth || 0, frame.clientWidth)
-  const naturalHeight = Math.max(1, root.scrollHeight, document.body?.scrollHeight || 0, frame.clientHeight)
+  const visibleStageBottom = visibleStage
+    ? visibleStage.getBoundingClientRect().bottom + (document.defaultView?.scrollY || root.scrollTop || 0)
+    : 0
+  const naturalHeight = stages.length
+    ? Math.max(1, root.scrollHeight, visibleStageBottom, frame.clientHeight)
+    : Math.max(1, root.scrollHeight, document.body?.scrollHeight || 0, frame.clientHeight)
   const scrollContainer = frame.closest<HTMLElement>('.annotated-page-scroll')
   const availableWidth = Math.max(1, (scrollContainer?.clientWidth || frame.clientWidth) - 36)
   const contentScale = Math.min(1, availableWidth / naturalWidth)
@@ -304,13 +316,11 @@ function locateInFrame(file: DesignFile) {
   frameScales.value = { ...frameScales.value, [file.id]: contentScale }
   frameWidths.value = { ...frameWidths.value, [file.id]: visualWidth }
   frameHeights.value = { ...frameHeights.value, [file.id]: measuredHeight }
-  const stages = Array.from(document.querySelectorAll<HTMLElement>('.stage'))
   const pixsoFrame = document.querySelector<HTMLElement>('.container-mark')
   const pixsoPages = pixsoPageItems(document)
   const hasStructuredAnchors = Boolean(document.querySelector('[data-review-anchor]'))
   const selectedPixsoPage = pixsoPages.find(element => element.classList.contains('selected'))
   const selectedPixsoPageName = selectedPixsoPage ? elementText(selectedPixsoPage).trim() : ''
-  const visibleStage = stages.find(stage => !stage.hidden && stage.offsetParent !== null)
   const activeView = document.querySelector<HTMLElement>('.review-bar [data-stage].is-active')?.dataset.stage
   const availableViews = [...new Set(Array.from(document.querySelectorAll<HTMLElement>('.review-bar [data-stage]')).map(element => element.dataset.stage || '').filter(Boolean))]
   frameHasStages.value = { ...frameHasStages.value, [file.id]: stages.length > 0 || pixsoPages.length > 0 || hasStructuredAnchors }
@@ -344,8 +354,8 @@ function locateInFrame(file: DesignFile) {
       }
       const rect = target.getBoundingClientRect()
       const width = Math.max(1, naturalWidth)
-      const scrollX = root.scrollLeft || document.body?.scrollLeft || 0
-      const scrollY = root.scrollTop || document.body?.scrollTop || 0
+      const scrollX = document.defaultView?.scrollX || root.scrollLeft || 0
+      const scrollY = document.defaultView?.scrollY || root.scrollTop || 0
       const centerX = rect.left + scrollX + rect.width / 2
       const centerY = rect.top + scrollY + rect.height / 2
       if (centerX >= 0 && centerX <= width && centerY >= 0 && centerY <= naturalHeight) {
@@ -448,10 +458,29 @@ function previewUrl(file: DesignFile) {
 }
 
 function activateIssueStage(issue: ReviewIssue, file: DesignFile) {
-  const stageName = issueStages.value[issue.id]
-  if (!stageName || frameStages.value[file.id] === stageName) return false
   const document = iframeRefs.get(file.id)?.contentDocument
   if (!document) return false
+  let stageName = issueStages.value[issue.id]
+  const stages = Array.from(document.querySelectorAll<HTMLElement>('.stage'))
+  if (stages.length) {
+    const elements = Array.from(document.querySelectorAll<HTMLElement>('.stage *'))
+      .filter(element => elementText(element).trim())
+      .slice(0, 6000)
+    const match = findIssueTarget(issue, elements)
+    const availableViews = [...new Set(Array.from(document.querySelectorAll<HTMLElement>('.review-bar [data-stage]')).map(element => element.dataset.stage || '').filter(Boolean))]
+    const resolvedStage = match?.stageName ? issueViewName(issue, match.stageName, availableViews) : ''
+    if (resolvedStage) {
+      stageName = resolvedStage
+      issueStages.value = { ...issueStages.value, [issue.id]: resolvedStage }
+    }
+  }
+  const activeView = document.querySelector<HTMLElement>('.review-bar [data-stage].is-active')?.dataset.stage
+  const visibleStage = stages.find(stage => !stage.hidden)?.id.replace(/^stage-/, '')
+  const currentStage = activeView || visibleStage || ''
+  if (!stageName || currentStage === stageName) {
+    if (currentStage) frameStages.value = { ...frameStages.value, [file.id]: currentStage }
+    return false
+  }
   const button = Array.from(document?.querySelectorAll<HTMLElement>('.review-bar [data-stage]') || [])
     .find(element => element.dataset.stage === stageName && !element.dataset.nameDemo && !element.dataset.listDemo && !element.dataset.pickerDemo)
   const pixsoPage = pixsoPageItems(document)

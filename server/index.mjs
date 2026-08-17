@@ -1,6 +1,5 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
-import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
@@ -18,17 +17,19 @@ import { renderAnalysisHtml } from './analysis-html-template.mjs'
 import { runLocalSkillWithDeepSeek } from './local-skill-runner.mjs'
 import { generateModelCompetitorComparison, generateModelDesignReview, generateModelRawRequirementReview, generateModelUiDesignReview, renderDesignPreviewHtml } from './design-review-pipeline.mjs'
 import { inspectCompetitorVersion } from './competitor-evidence.mjs'
+import { validateContrastChecks, validateExperienceReport } from './local-skill-validation.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
 const localRequirementSkillDir = path.join(__dirname, 'local-skills', 'designer-requirement-analysis-html')
-const wireframeSkillDir = path.join(process.env.CODEX_HOME || path.join(process.env.USERPROFILE || os.homedir(), '.codex'), 'skills', 'wireframe-design')
+const wireframeSkillDir = path.join(__dirname, 'local-skills', 'wireframe-design')
+const frontendDesignSkillDir = path.join(__dirname, 'local-skills', 'frontend-design')
 const reviewUiDesignSkillDir = process.env.DIP_REVIEW_UI_SKILL_DIR
   ? path.resolve(process.env.DIP_REVIEW_UI_SKILL_DIR)
-  : path.join(process.env.CODEX_HOME || path.join(process.env.USERPROFILE || os.homedir(), '.codex'), 'skills', 'review-ui-design')
+  : path.join(__dirname, 'local-skills', 'review-ui-design')
 const validateUserExperienceSkillDir = process.env.DIP_VALIDATE_USER_EXPERIENCE_SKILL_DIR
   ? path.resolve(process.env.DIP_VALIDATE_USER_EXPERIENCE_SKILL_DIR)
-  : path.join(process.env.CODEX_HOME || path.join(process.env.USERPROFILE || os.homedir(), '.codex'), 'skills', 'validate-user-experience')
+  : path.join(__dirname, 'local-skills', 'validate-user-experience')
 const dataDir = process.env.DIP_DATA_DIR ? path.resolve(process.env.DIP_DATA_DIR) : path.join(rootDir, '.data')
 const uploadDir = path.join(dataDir, 'uploads')
 const feedbackDir = path.join(dataDir, 'feedback')
@@ -154,6 +155,7 @@ function loadJson(file, fallback) {
 let db = loadJson(dbPath, null) || seedDatabase()
 let secrets = loadJson(secretPath, { apiKey: '' })
 const environmentApiKey = process.env.OPENAI_API_KEY || ''
+
 db.optimizationRuns ||= []
 db.settings.requirementSkillVersion = requirementAnalysisSkill.version
 const adminUsername = process.env.ADMIN_USERNAME || 'admin'
@@ -1178,7 +1180,7 @@ app.post('/api/requirements/:id/reviews', requireAuth, async (request, response)
     let uiDesignReviewError = baseReviewPartial && useReviewUiDesign ? '基础评审仍有失败页面，请先完成失败页面重试' : ''
     if (useReviewUiDesign && !baseReviewPartial) {
       try {
-        const skill = getReviewUiDesignSkillBundle()
+        const skill = getReviewUiDesignSkillBundle(requirement, design)
         uiDesignReviewSkillVersion = skill.version
         uiDesignResult = hasModel
           ? await generateUiDesignReviewWithModel(requirement, analysis, design, skill.systemPrompt)
@@ -1295,7 +1297,7 @@ app.post('/api/requirements/:id/reviews/:reviewId/base-retry', requireAuth, asyn
       let uiDesignResult = null
       if (review.uiDesignReviewEnabled) {
         try {
-          const skill = getReviewUiDesignSkillBundle()
+          const skill = getReviewUiDesignSkillBundle(requirement, design)
           review.uiDesignReviewSkillVersion = skill.version
           uiDesignResult = await generateUiDesignReviewWithModel(requirement, analysis, design, skill.systemPrompt)
           review.uiDesignReviewStatus = 'completed'
@@ -1643,7 +1645,9 @@ async function generateAnalysisWithModel(requirement, answered, ignored, previou
   })
 }
 
-function getReviewUiDesignSkillBundle() {
+function getReviewUiDesignSkillBundle(requirement, design) {
+  const sourceSignals = `${requirement?.source?.text || ''}\n${(design?.files || []).map((file) => file.name).join('\n')}`
+  const includeSources = /规范来源|规则来源|标准来源|WCAG|规范版本|联网复核|来源页码|适用范围|冲突处理/i.test(sourceSignals)
   const requiredFiles = [
     'SKILL.md',
     'references/visual-quality.md',
@@ -1651,6 +1655,7 @@ function getReviewUiDesignSkillBundle() {
     'references/interaction-quality.md',
     'references/design-system-quality.md',
     'references/report-template.md',
+    ...(includeSources ? ['references/sources.md'] : []),
   ]
   const sections = requiredFiles.map((relativePath) => {
     const filePath = path.join(reviewUiDesignSkillDir, relativePath)
@@ -1667,6 +1672,7 @@ function getReviewUiDesignSkillBundle() {
 function getValidateUserExperienceSkillBundle(requirement, design) {
   const sourceSignals = `${requirement.source?.text || ''}\n${(design.files || []).map((file) => file.name).join('\n')}`
   const includeInternationalization = /国际版|国际化|本地化|多语言|英文版|英语|English|RTL|i18n|locale/i.test(sourceSignals)
+  const includeSourceMap = /规范版本|规范来源|来源页码|适用范围|冲突处理|UIUE|WCAG|合规依据/i.test(sourceSignals)
   const requiredFiles = [
     'SKILL.md',
     'references/evaluation-framework.md',
@@ -1674,6 +1680,7 @@ function getValidateUserExperienceSkillBundle(requirement, design) {
     'references/interaction-accessibility.md',
     'references/web-uiue-standard.md',
     ...(includeInternationalization ? ['references/internationalization.md'] : []),
+    ...(includeSourceMap ? ['references/source-map.md'] : []),
   ]
   const sections = requiredFiles.map((relativePath) => {
     const filePath = path.join(validateUserExperienceSkillDir, relativePath)
@@ -1688,9 +1695,18 @@ function getValidateUserExperienceSkillBundle(requirement, design) {
 }
 
 function getWireframeSkillPrompt() {
-  const skillPath = path.join(wireframeSkillDir, 'SKILL.md')
-  if (!fs.existsSync(skillPath)) throw new Error('wireframe-design skill 未安装，请先安装后再生成线稿。')
-  return fs.readFileSync(skillPath, 'utf8')
+  const files = [
+    [wireframeSkillDir, 'SKILL.md'],
+    [wireframeSkillDir, 'references/patterns.md'],
+    [wireframeSkillDir, 'references/case-study.md'],
+    [frontendDesignSkillDir, 'SKILL.md'],
+  ]
+  const dependencyResolution = `项目已内置 frontend-design 作为 wireframe-design 的设计规范依赖。本次不得尝试调用未内置的 ui-ux-pro-max、.claude/skills 路径或其他 Codex 外部 Skill；需要设计规范时只使用下方 frontend-design 内容，并以 wireframe-design 的低保真纯线框约束为最高优先级。`
+  return dependencyResolution + files.map(([directory, relativePath]) => {
+    const filePath = path.join(directory, relativePath)
+    if (!fs.existsSync(filePath)) throw new Error(`线稿 Skill 依赖文件缺失：${path.basename(directory)}/${relativePath}`)
+    return `\n\n===== ${path.basename(directory)}/${relativePath} =====\n${fs.readFileSync(filePath, 'utf8')}`
+  }).join('')
 }
 
 function normalizeWireframeResult(result, requirement, analysis) {
@@ -1799,12 +1815,22 @@ async function generateRawReviewWithModel(requirement, design, experienceSkill) 
     compliancePrompt: designReviewSkill.systemPrompt,
     experiencePrompt: experienceSkill.systemPrompt,
     experienceSkillVersion: experienceSkill.version,
+    validateExperienceReport: (report) => validateExperienceReport(report, validateUserExperienceSkillDir),
     concurrency: reviewModelConcurrency(),
   })
 }
 
 async function generateUiDesignReviewWithModel(requirement, analysis, design, systemPrompt) {
-  return generateModelUiDesignReview({ requirement, analysis, design, uploadDir, callModel: callResponses, systemPrompt, concurrency: reviewModelConcurrency() })
+  return generateModelUiDesignReview({
+    requirement,
+    analysis,
+    design,
+    uploadDir,
+    callModel: callResponses,
+    systemPrompt,
+    validateContrastChecks: (checks) => validateContrastChecks(checks, reviewUiDesignSkillDir),
+    concurrency: reviewModelConcurrency(),
+  })
 }
 
 async function generateCompetitorReviewWithModel(requirement, analysis, design, competitor, baseReview) {
