@@ -53,5 +53,11 @@ export const api = {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   }),
   testSettings: () => request<{ ok: true; message: string }>('/api/settings/test', { method: 'POST' }),
+  changePassword: (body: { username: string; currentPassword: string; newPassword: string }) =>
+    request<{ ok: true; message: string }>('/api/auth/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
   runOptimization: (type: 'requirement' | 'review') => request<{ run: BootstrapData['optimizationRuns'][number] }>(`/api/optimizations/${type}/run`, { method: 'POST' }),
 }

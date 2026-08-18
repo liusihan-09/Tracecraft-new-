@@ -53,6 +53,62 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
   }
 }
 
+function passwordMatches(user, password) {
+  if (!user?.passwordHash || !user?.passwordSalt) return false
+  const candidate = hashPassword(password || '', user.passwordSalt).hash
+  try {
+    return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+const forceSyncPasswordsFromEnv = ['1', 'true', 'yes'].includes(String(process.env.DIP_SYNC_PASSWORDS_FROM_ENV || '').toLowerCase())
+
+function applyPassword(user, password, { managedLocally = false } = {}) {
+  const hashed = hashPassword(password)
+  user.passwordHash = hashed.hash
+  user.passwordSalt = hashed.salt
+  user.passwordManagedLocally = Boolean(managedLocally)
+}
+
+function ensureSeedUser({ id, username, displayName, role, password }) {
+  let user = db.users.find((item) => item.id === id) || db.users.find((item) => item.username === username)
+  if (!user) {
+    user = {
+      id,
+      username,
+      displayName,
+      role,
+      passwordManagedLocally: false,
+    }
+    applyPassword(user, password, { managedLocally: false })
+    db.users.push(user)
+    return true
+  }
+  let changed = false
+  if (user.username !== username) {
+    user.username = username
+    changed = true
+  }
+  if (user.role !== role) {
+    user.role = role
+    changed = true
+  }
+  if (!user.displayName) {
+    user.displayName = displayName
+    changed = true
+  }
+  // 页面改密后标记 passwordManagedLocally，避免重启被 .env 覆盖；
+  // 需要强制回写时设置 DIP_SYNC_PASSWORDS_FROM_ENV=1
+  const shouldSyncPassword = forceSyncPasswordsFromEnv || !user.passwordManagedLocally
+  if (shouldSyncPassword && !passwordMatches(user, password)) {
+    applyPassword(user, password, { managedLocally: false })
+    changed = true
+  }
+  return changed
+}
+
 function seedDatabase() {
   const adminPassword = hashPassword(process.env.ADMIN_PASSWORD || 'admin123')
   const userPassword = hashPassword(process.env.USER_PASSWORD || 'user123')
@@ -157,20 +213,30 @@ let secrets = loadJson(secretPath, { apiKey: '' })
 const environmentApiKey = process.env.OPENAI_API_KEY || ''
 
 db.optimizationRuns ||= []
+db.users ||= []
 db.settings.requirementSkillVersion = requirementAnalysisSkill.version
 const adminUsername = process.env.ADMIN_USERNAME || 'admin'
 const normalUsername = process.env.USER_USERNAME || 'user'
-for (const user of db.users) user.role ||= user.username === adminUsername ? 'admin' : 'user'
-if (!db.users.some((user) => user.username === normalUsername)) {
-  const password = hashPassword(process.env.USER_PASSWORD || 'user123')
-  db.users.push({
-    id: 'user_normal',
-    username: normalUsername,
-    displayName: '普通用户',
-    role: 'user',
-    passwordHash: password.hash,
-    passwordSalt: password.salt,
-  })
+const adminPassword = process.env.ADMIN_PASSWORD || 'admin123'
+const normalPassword = process.env.USER_PASSWORD || 'user123'
+ensureSeedUser({
+  id: 'user_admin',
+  username: adminUsername,
+  displayName: '设计平台管理员',
+  role: 'admin',
+  password: adminPassword,
+})
+ensureSeedUser({
+  id: 'user_normal',
+  username: normalUsername,
+  displayName: '普通用户',
+  role: 'user',
+  password: normalPassword,
+})
+for (const user of db.users) {
+  if (user.username === adminUsername) user.role = 'admin'
+  else if (user.username === normalUsername) user.role = 'user'
+  else user.role ||= 'user'
 }
 
 for (const requirement of db.requirements) {
@@ -632,10 +698,9 @@ function analytics() {
 app.post('/api/auth/login', (request, response) => {
   const { username, password } = request.body || {}
   const user = db.users.find((item) => item.username === username)
-  if (!user) return response.status(401).json({ message: '账号或密码错误' })
-  const candidate = hashPassword(password || '', user.passwordSalt).hash
-  const valid = crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.passwordHash, 'hex'))
-  if (!valid) return response.status(401).json({ message: '账号或密码错误' })
+  if (!user || !passwordMatches(user, password || '')) {
+    return response.status(401).json({ message: '账号或密码错误' })
+  }
   const token = crypto.randomBytes(32).toString('hex')
   sessions.set(token, { userId: user.id, createdAt: Date.now() })
   response.cookie('dip_session', token, { httpOnly: true, sameSite: 'lax', maxAge: 12 * 60 * 60 * 1000 })
@@ -651,6 +716,22 @@ app.post('/api/auth/logout', requireAuth, (request, response) => {
   sessions.delete(request.cookies.dip_session)
   response.clearCookie('dip_session')
   response.json({ ok: true })
+})
+
+app.post('/api/auth/change-password', (request, response) => {
+  const username = typeof request.body?.username === 'string' ? request.body.username.trim() : ''
+  const currentPassword = typeof request.body?.currentPassword === 'string' ? request.body.currentPassword : ''
+  const newPassword = typeof request.body?.newPassword === 'string' ? request.body.newPassword.trim() : ''
+  const user = db.users.find((item) => item.username === username)
+  if (!user || !passwordMatches(user, currentPassword)) {
+    return response.status(401).json({ message: '账号或当前密码不正确' })
+  }
+  if (!newPassword) return response.status(400).json({ message: '请填写新密码' })
+  if (newPassword.length < 6) return response.status(400).json({ message: '新密码至少 6 位' })
+  if (newPassword === currentPassword) return response.status(400).json({ message: '新密码不能与当前密码相同' })
+  applyPassword(user, newPassword, { managedLocally: true })
+  saveDb()
+  response.json({ ok: true, message: '密码已更新，请使用新密码登录' })
 })
 
 app.get('/api/bootstrap', requireAuth, (request, response) => {

@@ -25,6 +25,14 @@ const reviewTarget = ref<{ requirementId: string; reviewId: string } | null>(nul
 const mobileNav = ref(false)
 const loginBusy = ref(false)
 const loginForm = ref({ username: 'admin', password: 'admin123' })
+const changePasswordVisible = ref(false)
+const changePasswordBusy = ref(false)
+const changePasswordForm = ref({
+  username: '',
+  currentPassword: '',
+  newPassword: '',
+  confirmPassword: '',
+})
 
 const isAdmin = computed(() => data.value?.user.role === 'admin')
 const pageLabel = computed(() => ({
@@ -57,6 +65,52 @@ async function login() {
     ElMessage.error((error as Error).message)
   } finally {
     loginBusy.value = false
+  }
+}
+
+function openChangePassword() {
+  changePasswordForm.value = {
+    username: loginForm.value.username,
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  }
+  changePasswordVisible.value = true
+}
+
+async function submitChangePassword() {
+  const username = changePasswordForm.value.username.trim()
+  const currentPassword = changePasswordForm.value.currentPassword
+  const newPassword = changePasswordForm.value.newPassword.trim()
+  const confirmPassword = changePasswordForm.value.confirmPassword.trim()
+  if (!username) {
+    ElMessage.warning('请填写账号')
+    return
+  }
+  if (!currentPassword) {
+    ElMessage.warning('请填写当前密码')
+    return
+  }
+  if (newPassword.length < 6) {
+    ElMessage.warning('新密码至少 6 位')
+    return
+  }
+  if (newPassword !== confirmPassword) {
+    ElMessage.warning('两次输入的新密码不一致')
+    return
+  }
+
+  changePasswordBusy.value = true
+  try {
+    const result = await api.changePassword({ username, currentPassword, newPassword })
+    changePasswordVisible.value = false
+    loginForm.value.username = username
+    loginForm.value.password = ''
+    ElMessage.success(result.message)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    changePasswordBusy.value = false
   }
 }
 
@@ -127,12 +181,66 @@ onMounted(async () => {
           <el-input v-model="loginForm.username" autocomplete="username" :prefix-icon="User" />
         </el-form-item>
         <el-form-item label="密码">
-          <el-input v-model="loginForm.password" type="password" show-password autocomplete="current-password" :prefix-icon="Lock" />
+          <el-input
+            v-model="loginForm.password"
+            type="password"
+            show-password
+            autocomplete="current-password"
+            :prefix-icon="Lock"
+          />
+          <div class="login-password-actions">
+            <el-button class="login-change-password" link type="primary" @click.prevent="openChangePassword">修改密码</el-button>
+          </div>
         </el-form-item>
         <el-button type="primary" native-type="submit" :loading="loginBusy" size="large">进入工作台</el-button>
-        <el-alert title="管理员：admin / admin123 · 普通用户：user / user123" type="info" :closable="false" show-icon />
       </el-form>
     </el-card>
+
+    <el-dialog
+      v-model="changePasswordVisible"
+      title="修改密码"
+      width="420px"
+      align-center
+      destroy-on-close
+    >
+      <el-form label-position="top" size="large" @submit.prevent="submitChangePassword">
+        <el-form-item label="账号">
+          <el-input v-model="changePasswordForm.username" autocomplete="username" :prefix-icon="User" />
+        </el-form-item>
+        <el-form-item label="当前密码">
+          <el-input
+            v-model="changePasswordForm.currentPassword"
+            type="password"
+            show-password
+            autocomplete="current-password"
+            :prefix-icon="Lock"
+          />
+        </el-form-item>
+        <el-form-item label="新密码">
+          <el-input
+            v-model="changePasswordForm.newPassword"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            :prefix-icon="Lock"
+            placeholder="至少 6 位"
+          />
+        </el-form-item>
+        <el-form-item label="确认新密码">
+          <el-input
+            v-model="changePasswordForm.confirmPassword"
+            type="password"
+            show-password
+            autocomplete="new-password"
+            :prefix-icon="Lock"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="changePasswordVisible = false">取消</el-button>
+        <el-button type="primary" :loading="changePasswordBusy" @click="submitChangePassword">确认修改</el-button>
+      </template>
+    </el-dialog>
   </div>
 
   <el-container v-else class="app-shell">

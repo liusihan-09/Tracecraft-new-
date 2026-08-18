@@ -71,4 +71,4 @@ curl -s http://127.0.0.1:4318/api/auth/session
 curl -I http://127.0.0.1:83/
 ```
 
-演示账号（首次 seed，生产请改 `.env` 密码）：admin / admin123，user / user123
+演示账号默认：admin / admin123，user / user123。生产请在 `.env` 修改，或在登录页点「修改密码」（需知道当前密码）。页面改密后默认不会被 `.env` 覆盖；需要强制同步时设置 `DIP_SYNC_PASSWORDS_FROM_ENV=1`。
